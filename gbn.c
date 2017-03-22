@@ -99,20 +99,22 @@ ssize_t gbn_send(int sockfd, const void *buf, size_t len, int flags){
 	signal(SIGALRM, timeout_handler);
 	const void *progress = buf;
 	uint8_t temp_buf[DATALEN];
-	uint8_t last_seqnum_sent = s.last_seqnum - 1;
-	gbnhdr *generated_packets[N] = { NULL };
+	uint8_t last_seqnum_sent = s.last_seqnum;
+	gbnhdr generated_packets[N];
 	gbnhdr receiver = generate_hdr(0,0,NULL);
 	uint8_t base = s.last_seqnum;
 	ssize_t total_send = 0;
 	int attemptions = 0;
+	int rece_attemp = 0;
 	struct sockaddr_in from;
 	socklen_t fromlen = sizeof(from);
 	int data_size;
 	int last_segment = 0;
+	int time_out = 0;
 
 	socklen_t socklen = sizeof(struct sockaddr);
 
-	printf("State Change: from ESTABLISHED to DATA_SENDING_SLOW !!\n");
+	/*printf("State Change: from ESTABLISHED to DATA_SENDING !!\n");*/
 	s.state = DATA_SENDING;
 
 	while (s.state != ESTABLISHED && s.state != RESET && s.state != CLOSED) {
@@ -120,35 +122,36 @@ ssize_t gbn_send(int sockfd, const void *buf, size_t len, int flags){
 			case DATA_SENDING:
 				if (last_seqnum_sent == s.last_seqnum + s.windowsize) {
 					printf("The window is full now, wait for DATAACK to move on.\n");
-					printf("Stage Change: from DATA_SENDING to DATAACK_WAITING !!\n");
+					/*printf("Stage Change: from DATA_SENDING to DATAACK_WAITING !!\n");*/
 					s.state = DATAACK_WAITING;
 					break;
 				}
-				if (generated_packets[last_seqnum_sent + 1 - base] == NULL) {
-					if (progress >= buf + len - DATALEN && progress < buf + len) {
-						printf("This is the last data segment.\n");
-						data_size = (int)(uintptr_t)buf + len - (int)(uintptr_t)progress;
-						last_segment = 1;
-					}
-					else {
-						printf("This is a normal data segment.\n");
-						data_size = DATALEN;
-					}
-					memset(temp_buf, 0, DATALEN);
-					memcpy(temp_buf, progress, data_size);
-					progress += data_size;
-					gbnhdr temp = generate_hdr(DATA, last_seqnum_sent + 1, temp_buf);
-					generated_packets[last_seqnum_sent + 1 - base] = &temp;
+				/*if (generated_packets[last_seqnum_sent - base] == NULL) {*/
+				if (progress >= buf + len - DATALEN && progress < buf + len) {
+					printf("This is the last data segment.\n");
+					data_size = (int)(uintptr_t)buf + len - (int)(uintptr_t)progress;
+					last_segment = 1;
 				}
-				printf("seqnum: %d -- type: %d\n", generated_packets[last_seqnum_sent + 1 - base]->seqnum, generated_packets[last_seqnum_sent + 1 - base]->type);
-				int send_num = sendto(sockfd, generated_packets[last_seqnum_sent + 1 - base], sizeof(gbnhdr), 0, (struct sockaddr *)s.server, socklen);
+				else {
+					printf("This is a normal data segment.\n");
+					data_size = DATALEN;
+				}
+				memset(temp_buf, 0, DATALEN);
+				memcpy(temp_buf, progress, data_size);
+				progress += data_size;
+				gbnhdr temp = generate_hdr(DATA, last_seqnum_sent, temp_buf);
+				generated_packets[last_seqnum_sent - base] = temp;
+				/*}*/
+				printf("Sending type: %d -- seqnum: %d\n", generated_packets[last_seqnum_sent - base].type, generated_packets[last_seqnum_sent - base].seqnum);
+				printf("last_seqnum_sent: %d,     s.last_seqnum: %d\n", last_seqnum_sent, s.last_seqnum);
+				int send_num = maybe_sendto(sockfd, &generated_packets[last_seqnum_sent - base], sizeof(gbnhdr), 0, (struct sockaddr *)s.server, socklen);
 				if (send_num == -1) {
 					printf("Send DATA fail, attemptions: %d !! %s\n", ++attemptions, strerror(errno));
 					break;
 				}
 				else {
 					attemptions = 0;
-					printf("Send DATA succeed.");
+					printf("Send DATA succeed.\n");
 					last_seqnum_sent++;
 					total_send += send_num;
 				}
@@ -159,6 +162,7 @@ ssize_t gbn_send(int sockfd, const void *buf, size_t len, int flags){
 				if (recvfrom(sockfd, &receiver, sizeof(gbnhdr), 0, (struct sockaddr *)&from, &fromlen) == -1) {
                     			/*didn't receive because of timeout or some other issue*/
                     			/*if timeout, try again*/
+					printf("Receive DATAACK fail, attemptions: %d !! %s\n", ++rece_attemp, strerror(errno));
                     			if(errno != EINTR) {
                         			/*some problem other than timeout*/
                         			s.state = CLOSED;
@@ -166,17 +170,23 @@ ssize_t gbn_send(int sockfd, const void *buf, size_t len, int flags){
                     			}
 					else { 
 						printf("No DATAACK. DATA timeout, resent all DATA.\n"); 
-						s.windowsize = 0;
-						alarm(TIMEOUT);
+						printf("Set mode to SLOW !!\n");
+						s.windowsize = 1;
 						int i;
 						int a;
-						for (i = s.last_seqnum; i <= last_seqnum_sent; ++i) {
+						time_out = 1;
+						printf("last_seqnum_sent: %d,     s.last_seqnum: %d\n", last_seqnum_sent, s.last_seqnum);
+						for (i = s.last_seqnum; i < last_seqnum_sent; ++i) {
+							a = 0;
 							while (a < 5) {
-								if (sendto(sockfd, generated_packets[i - base], sizeof(gbnhdr), 0, (struct sockaddr *)s.server, socklen) == -1) {
+								printf("Sending type: %d -- seqnum: %d\n", generated_packets[i - base].type, generated_packets[i - base].seqnum);
+								if (maybe_sendto(sockfd, &generated_packets[i - base], sizeof(gbnhdr), 0, (struct sockaddr *)s.server, socklen) == -1) {
 									a++;
+									printf("Send DATA fail !!\n");
 									continue;
 								}
 								else {
+									printf("Send DATA succeed.\n");
 									break;
 								}
 							}
@@ -185,33 +195,45 @@ ssize_t gbn_send(int sockfd, const void *buf, size_t len, int flags){
 								s.state = CLOSED;
 								break;
 							}
-						}	
+						}
+						/*for (i = 0; i < N; ++i)	{ generated_packets[i] = NULL; }*/
 					}
                 		}
 				else {
                     			printf("\nGot something...\n");
 					if (sockaddr_cmp((struct sockaddr *)&from, (struct sockaddr *)s.server) != 0) { printf("Reject processing.\n"); s.state = RESET; break; }
                     			printf("type: %d -- seqnum: %d -- checksum: %d -- get_checksum: %d\n", receiver.type, receiver.seqnum, receiver.checksum, get_checksum(&receiver));
+					rece_attemp = 0;
                     			if (receiver.type == DATAACK && receiver.checksum == get_checksum(&receiver)) {
 						printf("Receive DATAACK. Cancel time out.\n");
+						if (s.last_seqnum > receiver.seqnum) {
+							break;
+						}
 						alarm(0);
 						s.last_seqnum = receiver.seqnum + 1;
 						if (last_segment == 1) {
-							printf("State Change: from DATA_WAITING to ESTABLISHED !!\n");
+							/*printf("State Change: from DATA_WAITING to ESTABLISHED !!\n");*/
 							s.state = ESTABLISHED;	
 						}
 						else {
-							printf("State Change: from DATA_WAITING to DATA_SENDING !!\n");
+							/*printf("State Change: from DATA_WAITING to DATA_SENDING !!\n");*/
 							s.state = DATA_SENDING;
 						}
-						s.windowsize = 1;
+						if (time_out == 1) {
+							time_out = 0;
+							last_seqnum_sent = s.last_seqnum;
+						}
+						else {
+							printf("Set mode to FAST !!\n");
+							s.windowsize = 2;
+						}
                     			}
                 		}
 				break;
 			default:
 				break;
 		}
-		if (attemptions > 5) { break; }
+		if (attemptions > 5 || rece_attemp > 5) { break; }
 	}
 	printf("\n==================== Leave gbn_send ====================\n\n\n");
 	return s.state == ESTABLISHED ? total_send : -1;
@@ -220,34 +242,46 @@ ssize_t gbn_send(int sockfd, const void *buf, size_t len, int flags){
 ssize_t gbn_recv(int sockfd, void *buf, size_t len, int flags) {
 	printf("\n\n\n==================== Enter gbn_recv ====================\n");
 
+	signal(SIGALRM, timeout_handler);
 	gbnhdr receiver = generate_hdr(0,0,NULL);
 	gbnhdr *ack_copy = NULL;
 	int attemptions = 0;
+	int rece_attemp = 0;
 	struct sockaddr_in from;
 	socklen_t fromlen = sizeof(from);
 	ssize_t result;
+	int outrange = 0;
 
-	printf("State Change: from ESTABLISHED to DATA_PENDING !!\n");
+	/*printf("State Change: from ESTABLISHED to DATA_PENDING !!\n");*/
 	s.state = DATA_PENDING;
 
 	while (s.state != ESTABLISHED && s.state != RESET) {
+		printf("s.last_seqnum: %d\n", s.last_seqnum);
 		switch(s.state) {
-			case DATA_PENDING:	
+			case DATA_PENDING:
+				alarm(TIMEOUT);	
 				if (recvfrom(sockfd, &receiver, sizeof(gbnhdr), 0, (struct sockaddr *)&from, &fromlen) == -1) {
 		    			/*didn't receive because of timeout or some other issue*/
 		    			/*if timeout, try again*/
+					printf("Receive DATA or FIN fail, attemptions: %d !! %s\n", ++rece_attemp, strerror(errno));
 		    			if(errno != EINTR) {
 		        			/*some problem other than timeout*/
 		        			s.state = CLOSED;
 						printf("Some problem with receive %s\n", strerror(errno));
 		    			}
-					else { printf("No FINACK. FIN timeout, resent FIN.\n"); }
 				}
 				else {	
 					printf("\nGot something...\n");
 					if (sockaddr_cmp((struct sockaddr *)&from, (struct sockaddr *)s.client) != 0) { printf("Reject processing.\n"); s.state = RESET; break; }
 					printf("type: %d -- seqnum: %d -- checksum: %d -- get_checksum: %d\n", receiver.type, receiver.seqnum, receiver.checksum, get_checksum(&receiver));
+					rece_attemp = 0;
+					s.state = DATA_RCVD;
+					if (receiver.seqnum != s.last_seqnum + 1) { 
+						outrange = 1;
+						break; 
+					}
 					if (receiver.type != FIN && receiver.checksum == get_checksum(&receiver)) {
+						alarm(0);
 						memcpy(buf, receiver.data, len);
 						int i = DATALEN - 1;
 						while (i >= 0 && receiver.data[i] == 0) i--;
@@ -256,8 +290,8 @@ ssize_t gbn_recv(int sockfd, void *buf, size_t len, int flags) {
 					else if (receiver.type == FIN && receiver.checksum == get_checksum(&receiver)) {
 						result = 0;
 					}
-					printf("State Change: from DATA_PENDING to DATA_RCVD !!\n");
-					s.state = DATA_RCVD;
+					/*printf("State Change: from DATA_PENDING to DATA_RCVD !!\n");*/
+					/*s.state = DATA_RCVD;*/
 				}
 				break;
 			case DATA_RCVD:
@@ -265,21 +299,29 @@ ssize_t gbn_recv(int sockfd, void *buf, size_t len, int flags) {
 					gbnhdr ack = generate_ack(receiver, &s.last_seqnum);
 					ack_copy = &ack;
 				}
-				if (sendto(sockfd, ack_copy, sizeof(gbnhdr), 0, (struct sockaddr *)s.client, *s.socklen) == -1) {
+				printf("Sending type: %d -- seqnum: %d\n", ack_copy->type, ack_copy->seqnum);
+				if (maybe_sendto(sockfd, ack_copy, sizeof(gbnhdr), 0, (struct sockaddr *)s.client, *s.socklen) == -1) {
 					printf("Send DATAACK or FINACK fail, attemptions: %d !! %s\n", ++attemptions, strerror(errno));
 					break;
 				}
 				else {
 					attemptions = 0;
 					printf("Send DATAACK or FINACK succeed.\n");
-					printf("State Change: from DATA_RCVD to ESABLISHED !!\n");
-					s.state = ESTABLISHED;
+					/*printf("State Change: from DATA_RCVD to ESABLISHED !!\n");*/
+					if (outrange == 1) {
+						outrange = 0;
+						ack_copy = NULL;
+						s.state	= DATA_PENDING;
+					}
+					else {
+						s.state = ESTABLISHED;
+					}
 				}
 				break;
 			default:
 				break;
 		}
-		if (attemptions >5) { break; }
+		if (attemptions > 5 || rece_attemp > 5) { break; }
 	}
 	printf("\n==================== Leave gbn_recv ====================\n\n\n");
 	return s.state == ESTABLISHED ? result : -1;
@@ -294,6 +336,8 @@ int gbn_close(int sockfd) {
 	/*Create receiver segment*/
 	gbnhdr receiver = generate_hdr(0, 0, NULL);
 	int attemptions = 0;
+	int rece_attemp = 0;
+	
 	struct sockaddr_in *address = s.server == NULL ? s.client : s.server;
 	
 	struct sockaddr_in from;
@@ -304,7 +348,7 @@ int gbn_close(int sockfd) {
 	while (s.state != CLOSED && s.state != RESET) {
 		switch(s.state) {
 			case ESTABLISHED:/*send FIN, receive FINACK, state ESTABLISHED => FIN_WAIT*/
-				if (sendto(sockfd, &fin, sizeof(gbnhdr), 0, (struct sockaddr *)address, socklen) == -1) {
+				if (maybe_sendto(sockfd, &fin, sizeof(gbnhdr), 0, (struct sockaddr *)address, socklen) == -1) {
 					printf("Send FIN fail, attemptions: %d !! %s\n", ++attemptions, strerror(errno));
 					break;
 				}
@@ -317,6 +361,7 @@ int gbn_close(int sockfd) {
 				if (recvfrom(sockfd, &receiver, sizeof(gbnhdr), 0, (struct sockaddr *)&from, &fromlen) == -1) {
                     			/*didn't receive because of timeout or some other issue*/
                     			/*if timeout, try again*/
+					printf("Receive FINACK fail, attemptions: %d !! %s\n", ++rece_attemp, strerror(errno));
                     			if(errno != EINTR) {
                         			/*some problem other than timeout*/
                         			s.state = CLOSED;
@@ -328,6 +373,7 @@ int gbn_close(int sockfd) {
                     			printf("\nGot something...\n");
 					if (sockaddr_cmp((struct sockaddr *)&from, (struct sockaddr *)address) != 0) { printf("Reject processing.\n"); s.state = RESET; break; }
                     			printf("type: %d -- seqnum: %d -- checksum: %d -- get_checksum: %d\n", receiver.type, receiver.seqnum, receiver.checksum, get_checksum(&receiver));
+					rece_attemp = 0;
                     			if (receiver.type == FINACK && receiver.checksum == get_checksum(&receiver)) {
 						printf("Receive FINACK. Cancel time out.\n");
 						alarm(0);
@@ -344,6 +390,7 @@ int gbn_close(int sockfd) {
 				if (recvfrom(sockfd, &receiver, sizeof(gbnhdr), 0, (struct sockaddr *)&from, &fromlen) == -1) {
                     			/*didn't receive because of timeout or some other issue*/
                     			/*if timeout, try again*/
+					printf("Receive FIN fail, attemptions: %d !! %s\n", ++rece_attemp, strerror(errno));
                     			if(errno != EINTR) {
                         			/*some problem other than timeout*/
 						printf("Some problem with receive %s\n", strerror(errno));
@@ -357,12 +404,13 @@ int gbn_close(int sockfd) {
                     			printf("\nGot something...\n");
 					if (sockaddr_cmp((struct sockaddr *)&from, (struct sockaddr *)address) != 0) { printf("Reject processing.\n"); s.state = RESET; break; }
                     			printf("type: %d -- seqnum: %d -- checksum: %d -- get_checksum: %d\n", receiver.type, receiver.seqnum, receiver.checksum, get_checksum(&receiver));
+					rece_attemp = 0;
                     			if (receiver.type == FIN && receiver.checksum == get_checksum(&receiver)) {
 						alarm(0);
                         			s.state = CLOSED;
 						printf("State Change: from FIN_WAIT to CLOSED !!\n");
 						gbnhdr finack = generate_ack(receiver, &s.last_seqnum);
-						if (sendto(sockfd, &finack, sizeof(gbnhdr), 0, (struct sockaddr *)address, socklen) == -1) {
+						if (maybe_sendto(sockfd, &finack, sizeof(gbnhdr), 0, (struct sockaddr *)address, socklen) == -1) {
 							printf("Send FINACK fail, attemptions: %d !! %s\n", ++attemptions, strerror(errno));
 						}
 						else {
@@ -377,7 +425,7 @@ int gbn_close(int sockfd) {
 			default:
 				break;
 		}
-		if (attemptions > 5) { break; }
+		if (attemptions > 5 || rece_attemp > 5) { break; }
 	}
 	printf("\n==================== Leave gbn_close ====================\n\n\n");
 	return s.state == CLOSED ? close(sockfd) : -1;
@@ -401,11 +449,12 @@ int gbn_connect(int sockfd, const struct sockaddr *server, socklen_t socklen) {
 	socklen_t fromlen = sizeof(from);
 
 	int attemptions = 0;
+	int rece_attemp = 0;
 	s.state = CLOSED;
 	while (s.state != ESTABLISHED && s.state != RESET) {
 		switch(s.state) {
 			case CLOSED:/*send SYN, state CLOSED => SYN_SENT*/
-				if (sendto(sockfd, &syn, sizeof(gbnhdr), 0, (struct sockaddr *)server, socklen) == -1) {
+				if (maybe_sendto(sockfd, &syn, sizeof(gbnhdr), 0, (struct sockaddr *)server, socklen) == -1) {
 					printf("Send SYN fail, attemptions: %d !! %s\n", ++attemptions, strerror(errno));
 					break;
 				}
@@ -417,6 +466,7 @@ int gbn_connect(int sockfd, const struct sockaddr *server, socklen_t socklen) {
 				if (recvfrom(sockfd, &receiver, sizeof(gbnhdr), 0, (struct sockaddr *)&from, &fromlen) == -1) {
                     			/*didn't receive because of timeout or some other issue*/
                     			/*if timeout, try again*/
+					printf("Receive SYNACK fail, attemptions: %d !! %s\n", ++rece_attemp, strerror(errno));
                     			if(errno != EINTR) {
                         			/*some problem other than timeout*/
                         			s.state = CLOSED;
@@ -428,6 +478,7 @@ int gbn_connect(int sockfd, const struct sockaddr *server, socklen_t socklen) {
                     			printf("\nGot something...\n");
 					if (sockaddr_cmp((struct sockaddr *)&from, (struct sockaddr *)server) != 0) { printf("Reject processing.\n"); s.state = RESET; break; }
                     			printf("type: %d -- seqnum: %d -- checksum: %d -- get_checksum: %d\n", receiver.type, receiver.seqnum, receiver.checksum, get_checksum(&receiver));
+					rece_attemp = 0;
                     			if (receiver.type == SYNACK && receiver.checksum == get_checksum(&receiver)) {
 						printf("Receive SYNACK. Cancel time out.\n");
 						alarm(0);
@@ -444,7 +495,7 @@ int gbn_connect(int sockfd, const struct sockaddr *server, socklen_t socklen) {
 					s.last_seqnum++;
 					dataack_copy = &dataack;
 				}
-				if (sendto(sockfd, dataack_copy, sizeof(gbnhdr), 0, (struct sockaddr *)server, socklen) == -1) {
+				if (maybe_sendto(sockfd, dataack_copy, sizeof(gbnhdr), 0, (struct sockaddr *)server, socklen) == -1) {
 					printf("Send DATAACK fail, attemptions: %d !! %s\n", ++attemptions, strerror(errno));
 					break;
 				}
@@ -458,7 +509,7 @@ int gbn_connect(int sockfd, const struct sockaddr *server, socklen_t socklen) {
 			default:
 				break;
 		}
-		if (attemptions > 5)
+		if (attemptions > 5 || rece_attemp > 5)
 			break;
 	}
 	printf("\n==================== Leave gbn_connect ====================\n\n\n");
@@ -490,7 +541,7 @@ int gbn_socket(int domain, int type, int protocol){
 	
 	/*initial the state_t s	*/
 	s = *(state_t *)malloc(sizeof(state_t));
-	s.windowsize = 0;
+	s.windowsize = 1;
 	printf("\n==================== Leave gbn_socket ====================\n\n\n");
 	return socket(domain, type, protocol);
 }
@@ -506,6 +557,7 @@ int gbn_accept(int sockfd, struct sockaddr *client, socklen_t *socklen) {
 	gbnhdr *synack_copy = NULL;
 
 	int attemptions = 0;
+	int rece_attemp = 0;
 
 	while (s.state != ESTABLISHED && s.state != RESET) {
 		switch(s.state) {
@@ -513,6 +565,7 @@ int gbn_accept(int sockfd, struct sockaddr *client, socklen_t *socklen) {
 				if (recvfrom(sockfd, &receiver, sizeof(gbnhdr), 0, (struct sockaddr *)client, socklen) == -1) {
                     			/*didn't receive because of timeout or some other issue*/
                     			/*if timeout, try again*/
+					printf("Receive SYN fail, attemptions: %d !! %s\n", ++rece_attemp, strerror(errno));
                     			if(errno != EINTR) {
                         			/*some problem other than timeout*/
                         			s.state = CLOSED;
@@ -522,6 +575,7 @@ int gbn_accept(int sockfd, struct sockaddr *client, socklen_t *socklen) {
 				else {
                     			printf("\nGot something...\n");
                     			printf("type: %d -- seqnum: %d -- checksum: %d -- get_checksum: %d\n", receiver.type, receiver.seqnum, receiver.checksum, get_checksum(&receiver));
+					rece_attemp = 0;
                     			if (receiver.type == SYN && receiver.checksum == get_checksum(&receiver)) {
 						printf("Receive SYN. Ready to send SYNACK.\n");
                         			s.state = SYN_RCVD;
@@ -540,7 +594,7 @@ int gbn_accept(int sockfd, struct sockaddr *client, socklen_t *socklen) {
 					gbnhdr synack = generate_ack(receiver, &s.last_seqnum);
 					synack_copy = &synack;
 				}
-				if (sendto(sockfd, synack_copy, sizeof(gbnhdr), 0, (struct sockaddr *)client, *socklen) == -1) {
+				if (maybe_sendto(sockfd, synack_copy, sizeof(gbnhdr), 0, (struct sockaddr *)client, *socklen) == -1) {
 					printf("Send SYNACK fail, attemptions: %d !! %s\n", ++attemptions, strerror(errno));
 					break;
 				}
@@ -552,6 +606,7 @@ int gbn_accept(int sockfd, struct sockaddr *client, socklen_t *socklen) {
 				if (recvfrom(sockfd, &receiver, sizeof(gbnhdr), 0, (struct sockaddr *)client, socklen) == -1) {
                     			/* didn't receive because of timeout or some other issue*/
                     			/* if timeout, try again*/
+					printf("Receive DATAACK fail, attemptions: %d !! %s\n", ++rece_attemp, strerror(errno));
                     			if(errno != EINTR) {
                         			/* some problem other than timeout*/
                         			s.state = CLOSED;
@@ -562,6 +617,7 @@ int gbn_accept(int sockfd, struct sockaddr *client, socklen_t *socklen) {
 				else {
                     			printf("\nGot something...\n");
                     			printf("type: %d -- seqnum: %d -- checksum: %d -- get_checksum: %d\n", receiver.type, receiver.seqnum, receiver.checksum, get_checksum(&receiver));
+					rece_attemp = 0;
                     			if (receiver.type == DATAACK && receiver.checksum == get_checksum(&receiver)) {	
 						printf("Receive DATAACK. Cancel time out.\n");
 						alarm(0);
@@ -571,13 +627,14 @@ int gbn_accept(int sockfd, struct sockaddr *client, socklen_t *socklen) {
 						s.socklen = socklen;
 						printf("State Change: from SYNACK_RCVD to ESTABLISHED !!\n");
                     			}
+					else { s.state = RESET; }
                 		}	
 				break;
 			default:
 				break;
 			
 		}
-		if (attemptions > 5) { break; }
+		if (attemptions > 5 || rece_attemp > 5) { break; }
 	}
 	printf("\n==================== Leave gbn_accept ====================\n\n\n");
 	return s.state == ESTABLISHED ? sockfd : -1;
